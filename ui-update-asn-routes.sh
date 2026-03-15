@@ -1,55 +1,44 @@
 #!/bin/sh
 set -eu
-UNIFI_HOST=${UNIFI_HOST:-$(ip route show default 0.0.0.0/0 | awk '/default/ {print $3}')}
-UNIFI_INSECURE=${UNIFI_INSECURE:-0}
 VERBOSE=${VERBOSE:-0}
 : "${UNIFI_API_TOKEN}"
 : "${ASNLOOKUP_API_TOKEN}"
 
-# Verify UniFi API connection certificate
-EXIT_STATUS=0
-curl -sf "https://${UNIFI_HOST}/" >/dev/null 2>&1 || EXIT_STATUS=$?
-if [ "${EXIT_STATUS}" -eq 0 ]; then
-	echo "[INFO] Connecting to ${UNIFI_HOST} using system cacert." >&2
-	alias unifi='curl -sSf -H "X-API-KEY: ${UNIFI_API_TOKEN}"'
-elif [ -f ./cacert.pem ]; then
-	if curl -sf --cacert ./cacert.pem "https://${UNIFI_HOST}/" >/dev/null 2>&1; then
-		echo "[INFO] Connecting to ${UNIFI_HOST} using custom cacert." >&2
-		alias unifi='curl -sSf --cacert ./cacert.pem -H "X-API-KEY: ${UNIFI_API_TOKEN}"'
-	else
-		echo "[ERROR] Failed to connect to ${UNIFI_HOST} using custom cacert." >&2
-		curl -sSf --cacert ./cacert.pem "https://${UNIFI_HOST}/"
-		exit 1
-	fi
-elif [ "${EXIT_STATUS}" -eq 60 ]; then
-	if [ "${UNIFI_INSECURE}" -eq 0 ]; then
-		echo "[ERROR] Failed to connect to ${UNIFI_HOST}, SSL certificate problem. Please provide a custom CA certificate in ./cacert.pem or set \$UNIFI_INSECURE=1 (not recommended)." >&2
-		curl -sSf "https://${UNIFI_HOST}/"
-		exit 1
-	fi
-	if curl -sfk "https://${UNIFI_HOST}/" >/dev/null 2>&1; then
-		echo "[INFO] Connecting to ${UNIFI_HOST} using insecure connection. To secure connection, please provide a custom CA certificate in ./cacert.pem." >&2
-		alias unifi='curl -sSfk -H "X-API-KEY: ${UNIFI_API_TOKEN}"'
-	else
-		echo "[ERROR] Failed to connect to ${UNIFI_HOST} using insecure connection." >&2
-		curl -sSfk "https://${UNIFI_HOST}/"
-		exit 1
-	fi
+UNIFI_API_BASE="https://api.ui.com"
+alias unifi='curl -sSf -H "X-API-KEY: ${UNIFI_API_TOKEN}"'
+
+# Resolve host ID
+if [ -n "${UNIFI_HOST_ID:-}" ]; then
+	echo "[INFO] Using configured host ID: ${UNIFI_HOST_ID}" >&2
 else
-	echo "[ERROR] Failed to connect to ${UNIFI_HOST} using system cacert." >&2
-	curl -sSf "https://${UNIFI_HOST}/"
-	exit 1
+	echo "[INFO] Resolving host ID from Site Manager API..." >&2
+	HOSTS_RESPONSE=$(unifi "${UNIFI_API_BASE}/v1/hosts" -H 'Accept: application/json')
+	HOST_COUNT=$(echo "${HOSTS_RESPONSE}" | jq '.data | length')
+	if [ "${HOST_COUNT}" -eq 0 ]; then
+		echo "[ERROR] No hosts found in your UniFi account." >&2
+		exit 1
+	elif [ "${HOST_COUNT}" -eq 1 ]; then
+		UNIFI_HOST_ID=$(echo "${HOSTS_RESPONSE}" | jq -r '.data[0].id')
+		HOST_NAME=$(echo "${HOSTS_RESPONSE}" | jq -r '.data[0].reportedState.hostname // "unknown"')
+		echo "[INFO] Found 1 host: ${HOST_NAME} (${UNIFI_HOST_ID})" >&2
+	else
+		echo "[ERROR] Found ${HOST_COUNT} hosts. Set \$UNIFI_HOST_ID to select one:" >&2
+		echo "${HOSTS_RESPONSE}" | jq -r '.data[] | "  \(.id)  \(.reportedState.hostname // "unknown")"' >&2
+		exit 1
+	fi
 fi
 
+CONNECTOR_BASE="${UNIFI_API_BASE}/v1/connector/consoles/${UNIFI_HOST_ID}"
+
 # Verify UniFi API connection credential
-if ! unifi "https://${UNIFI_HOST}/proxy/network/integration/v1/info" >/dev/null 2>&1; then
-	echo "[ERROR] Failed to request API information from ${UNIFI_HOST}. Please check if \$UNIFI_API_TOKEN is configured correctly." >&2
-	unifi "https://${UNIFI_HOST}/proxy/network/integration/v1/info"
+if ! unifi "${CONNECTOR_BASE}/proxy/network/integration/v1/info" >/dev/null 2>&1; then
+	echo "[ERROR] Failed to request API information via Cloud Connector. Please check if \$UNIFI_API_TOKEN is configured correctly and has Network access." >&2
+	unifi "${CONNECTOR_BASE}/proxy/network/integration/v1/info"
 	exit 1
 fi
 
 # Process rules
-RULES_ALL=$(unifi -X GET "https://${UNIFI_HOST}/proxy/network/v2/api/site/default/trafficroutes" -H 'Accept: application/json' | jq -c 'map(select(.enabled))')
+RULES_ALL=$(unifi -X GET "${CONNECTOR_BASE}/proxy/network/v2/api/site/default/trafficroutes" -H 'Accept: application/json' | jq -c 'map(select(.enabled))')
 MATCHING_RULE_NAMES=$(echo "${RULES_ALL}" | jq -r .[].description | grep '^AS[0-9]* ' | sort | uniq)
 if [ "${VERBOSE}" -ne 0 ]; then
 	echo "[TRACE] MATCHING_RULE_NAMES=${MATCHING_RULE_NAMES}" >&2
@@ -86,18 +75,19 @@ for ASN in ${ASNS}; do
 			echo "[TRACE] NEW_IPS=[]" >&2
 		fi
 		if [ "${ASN_RULE_NAME}" = "${ASN_RULE_NAME_PREFIX}" ] || [ "${ASN_RULE_NAME}" = "${ASN_RULE_NAME_PREFIX} IPv4" ]; then
-			NEW_IPS="${NEW_IPS}+$(echo "${ASNLOOKUP}" | jq -r '.[0] | .ipv4_prefix[]' | aggregate6 | jq -cRn '[inputs | select(length > 0)] | map({"ip_or_subnet":.,"ip_version":"v4","port_ranges":[],"ports":[]})')"
+			IPV4_IPS=$(echo "${ASNLOOKUP}" | jq -r '.[0] | .ipv4_prefix[]' | aggregate6 | jq -cRn '[inputs | select(length > 0)] | map({"ip_or_subnet":.,"ip_version":"v4","port_ranges":[],"ports":[]})')
+			NEW_IPS=$(printf '%s\n%s' "${NEW_IPS}" "${IPV4_IPS}" | jq -sc 'add')
 			if [ "${VERBOSE}" -ne 0 ]; then
 				echo "[TRACE] NEW_IPS+=IPv4" >&2
 			fi
 		fi
 		if [ "${ASN_RULE_NAME}" = "${ASN_RULE_NAME_PREFIX}" ] || [ "${ASN_RULE_NAME}" = "${ASN_RULE_NAME_PREFIX} IPv6" ]; then
-			NEW_IPS="${NEW_IPS}+$(echo "${ASNLOOKUP}" | jq -r '.[0] | .ipv6_prefix[]' | aggregate6 | jq -cRn '[inputs | select(length > 0)] | map({"ip_or_subnet":.,"ip_version":"v6","port_ranges":[],"ports":[]})')"
+			IPV6_IPS=$(echo "${ASNLOOKUP}" | jq -r '.[0] | .ipv6_prefix[]' | aggregate6 | jq -cRn '[inputs | select(length > 0)] | map({"ip_or_subnet":.,"ip_version":"v6","port_ranges":[],"ports":[]})')
+			NEW_IPS=$(printf '%s\n%s' "${NEW_IPS}" "${IPV6_IPS}" | jq -sc 'add')
 			if [ "${VERBOSE}" -ne 0 ]; then
 				echo "[TRACE] NEW_IPS+=IPv6" >&2
 			fi
 		fi
-		NEW_IPS=$(jq -cn "${NEW_IPS}")
 		if [ "${VERBOSE}" -ne 0 ]; then
 			echo "[TRACE] NEW_IPS=${NEW_IPS}" >&2
 		fi
@@ -141,12 +131,12 @@ EOF
 				if [ "${VERBOSE}" -ne 0 ]; then
 					echo "[TRACE] CHANGESET>0" >&2
 				fi
-				ASN_RULE_NEW=$(echo "${ASN_RULE_OLD}" | jq -c ".ip_addresses=${NEW_IPS}")
-				ASN_RULE_URL="https://${UNIFI_HOST}/proxy/network/v2/api/site/default/trafficroutes/${ASN_RULE_ID}"
+				ASN_RULE_NEW=$(printf '%s\n%s' "${ASN_RULE_OLD}" "${NEW_IPS}" | jq -sc '.[0].ip_addresses = .[1] | .[0]')
+				ASN_RULE_URL="${CONNECTOR_BASE}/proxy/network/v2/api/site/default/trafficroutes/${ASN_RULE_ID}"
 				if [ "${VERBOSE}" -ne 0 ]; then
 					echo "[TRACE] ASN_RULE_URL=${ASN_RULE_URL}" >&2
 				fi
-				unifi -X PUT "${ASN_RULE_URL}" -d "${ASN_RULE_NEW}" -H 'Accept: application/json' -H 'Content-Type: application/json' >/dev/null
+				echo "${ASN_RULE_NEW}" | unifi -X PUT "${ASN_RULE_URL}" -d @- -H 'Accept: application/json' -H 'Content-Type: application/json' >/dev/null
 				printf "%s [%s]:\n%s\n" "${ASN_RULE_NAME}" "${ASN_RULE_ID}" "${CHANGESET}"
 			fi
 		done
